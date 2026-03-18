@@ -241,7 +241,7 @@ async def handle_incoming_message(customer_phone: str, customer_name: str, messa
 
         # Call Gemini
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="models/gemini-2.5-flash",
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -292,7 +292,7 @@ async def handle_incoming_message(customer_phone: str, customer_name: str, messa
             ))
 
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="models/gemini-2.5-flash",
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
