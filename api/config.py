@@ -10,18 +10,18 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "Noduz2026").strip()
 APP_SECRET = os.getenv("APP_SECRET", "").strip()
 
 # Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 
 # Gemini
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 # Google Calendar
-GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
 # App
-TIMEZONE = os.getenv("TIMEZONE", "America/Mexico_City")
+TIMEZONE = os.getenv("TIMEZONE", "America/Mexico_City").strip()
 
 # Business info — Family Barber
 BUSINESS_NAME = "Family Barber"
