@@ -6,7 +6,7 @@ load_dotenv()
 # WhatsApp
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "Noduz2026")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "Noduz2026").strip()
 APP_SECRET = os.getenv("APP_SECRET", "")
 
 # Supabase
