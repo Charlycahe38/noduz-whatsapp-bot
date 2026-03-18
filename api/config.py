@@ -4,10 +4,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # WhatsApp
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
+WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "").strip()
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "Noduz2026").strip()
-APP_SECRET = os.getenv("APP_SECRET", "")
+APP_SECRET = os.getenv("APP_SECRET", "").strip()
 
 # Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
