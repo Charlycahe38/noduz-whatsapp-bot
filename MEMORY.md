@@ -33,3 +33,28 @@ It serves as a running log of all changes, decisions, and context built up over 
 5. Create new Vercel project from that repo.
 6. Set all env vars in Vercel including `CLIENT_ID`.
 7. Point Meta webhook to new Vercel URL.
+
+---
+
+## Session 2 — 2026-03-23
+
+### Architecture decisions
+- Confirmed: **separate repo per client** is the right approach at current scale. One template repo, duplicated per client, each with its own Vercel project and `config.py`. All share one Supabase DB isolated by `client_id`.
+- The AI system prompt IS the business logic — different clients don't need different code, they need a different prompt built from their config. No separate repo needed just for AI behavior differences.
+- `MEMORY.md` established as the session log for this project. Must be updated at the end of every Claude Code session. Rule added to `CLAUDE.md` under "END OF SESSION".
+
+### New files
+- `MEMORY.md` — session log, committed to git so it persists across machines and collaborators.
+- `scripts/migrate_add_clients.sql` — migration for existing Supabase deployments to add `clients` table and `client_id` columns to existing tables, with backfill for Family Barber.
+- `CLIENT_ONBOARDING_QUESTIONS.md` — gitignored. 22 questions in Spanish (2 sections: technical credentials + business profile) ready to copy into Google Forms for new clients.
+
+### CLAUDE.md changes
+- Added **END OF SESSION** section with format template for updating `MEMORY.md` at the end of every session.
+
+### .gitignore changes
+- Added `CLIENT_ONBOARDING_QUESTIONS.md`.
+
+### Pending / next steps
+- Run `scripts/migrate_add_clients.sql` in Supabase SQL Editor for Family Barber (fill in real credentials before running).
+- Add `CLIENT_ID` env var in Vercel dashboard for the Family Barber deployment.
+- Future: update `ai_agent.py` to build system prompt dynamically from `clients` table row (currently still reads from hardcoded `config.py`).
