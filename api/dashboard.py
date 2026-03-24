@@ -2,16 +2,19 @@ import json
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse
 from api.supabase_client import supabase
+from api.config import CLIENT_ID, BUSINESS_NAME
 
 router = APIRouter()
 
 
 @router.get("/api/conversations")
 async def get_conversations():
-    result = supabase.table("conversations") \
+    query = supabase.table("conversations") \
         .select("customer_phone, customer_name, messages, last_message_at") \
-        .order("last_message_at", desc=True) \
-        .execute()
+        .order("last_message_at", desc=True)
+    if CLIENT_ID:
+        query = query.eq("client_id", CLIENT_ID)
+    result = query.execute()
     rows = []
     for r in result.data:
         msgs = r.get("messages", [])
@@ -35,16 +38,19 @@ async def get_conversations():
 
 @router.get("/api/appointments")
 async def get_appointments():
-    result = supabase.table("appointments") \
+    query = supabase.table("appointments") \
         .select("*") \
-        .order("appointment_date", desc=True) \
-        .execute()
+        .order("appointment_date", desc=True)
+    if CLIENT_ID:
+        query = query.eq("client_id", CLIENT_ID)
+    result = query.execute()
     return JSONResponse(content=result.data)
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    return HTMLResponse(content=DASHBOARD_HTML)
+    html = DASHBOARD_HTML.replace("{{BUSINESS_NAME}}", BUSINESS_NAME)
+    return HTMLResponse(content=html)
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -52,7 +58,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Family Barber — Dashboard</title>
+<title>{{BUSINESS_NAME}} — Dashboard</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #1a1a1a; }
@@ -143,7 +149,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
 
 <div class="header">
-  <h1>Family Barber <span>/ Dashboard</span></h1>
+  <h1>{{BUSINESS_NAME}} <span>/ Dashboard</span></h1>
   <div style="display:flex;align-items:center;gap:12px;">
     <span class="last-update" id="lastUpdate"></span>
     <button class="refresh-btn" onclick="loadAll()">↻ Actualizar</button>

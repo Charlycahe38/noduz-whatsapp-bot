@@ -3,9 +3,11 @@ __pycache__/
 .env
 SECRETS.md
 CLIENT_PROFILE.md
+CLIENT_ONBOARDING_QUESTIONS.md
 google-credentials.json
 barbershop-489419-98b225146c60.json
 *.json.bak
 venv/
 .vercel/
 node_modules/
+.vercel

@@ -663,6 +663,44 @@ CLIENT_PROFILE.md
 
 ---
 
+## END OF SESSION — REQUIRED LAST STEP
+
+At the end of every Claude Code session, before closing, **update `MEMORY.md`** with a new dated section covering:
+
+1. **Architecture decisions** — any choices made and the reasoning behind them
+2. **DB changes** — new tables, columns, migrations, index changes
+3. **Code changes** — which files were modified and what changed
+4. **New files created** — purpose of each
+5. **Bugs fixed** — what broke and how it was solved
+6. **Pending / next steps** — anything left to do or follow up on
+
+Format:
+```markdown
+## Session N — YYYY-MM-DD
+
+### Architecture decisions
+...
+
+### DB changes
+...
+
+### Code changes
+...
+
+### New files
+...
+
+### Bugs fixed
+...
+
+### Pending
+...
+```
+
+This file is the project's memory. Future sessions should read it first to understand what has already been built and decided.
+
+---
+
 ## WHAT SUCCESS LOOKS LIKE
 
 1. `git push` deploys to Vercel automatically

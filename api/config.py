@@ -23,6 +23,9 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 # App
 TIMEZONE = os.getenv("TIMEZONE", "America/Mexico_City").strip()
 
+# Client ID — unique per Vercel deployment, links this instance to a row in the clients table
+CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
+
 # Business info — Family Barber
 BUSINESS_NAME = "Family Barber"
 BUSINESS_TYPE = "barbershop"
