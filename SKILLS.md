@@ -130,7 +130,7 @@ import httpx
 from api.config import WHATSAPP_TOKEN, WHATSAPP_PHONE_ID
 
 async def send_message(to: str, message: str):
-    url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_ID}/messages"
+    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
@@ -143,7 +143,10 @@ async def send_message(to: str, message: str):
     }
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, json=payload, headers=headers)
-        return resp.json()
+        result = resp.json()
+        if resp.status_code != 200:
+            print(f"[whatsapp] Send failed to={to} status={resp.status_code}: {result}")
+        return result
 
 def parse_message(body: dict) -> dict | None:
     """Parse incoming WhatsApp webhook payload. Returns None if not a text message."""
@@ -176,10 +179,18 @@ def parse_message(body: dict) -> dict | None:
 ## SKILL 5: Webhook Handlers
 
 ### api/webhook.py
+
+> ⚠️ CRITICAL: Do NOT use `BackgroundTasks` on Vercel. Vercel freezes the process
+> after the response is sent — background tasks never execute. Process synchronously.
+
 ```python
-from fastapi import APIRouter, Request, BackgroundTasks
+import hashlib
+import hmac
+import traceback
+
+from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
-from api.config import VERIFY_TOKEN
+from api.config import VERIFY_TOKEN, APP_SECRET
 from api.whatsapp import parse_message
 from api.ai_agent import handle_incoming_message
 
@@ -196,23 +207,36 @@ async def verify(request: Request):
     return PlainTextResponse(content="Forbidden", status_code=403)
 
 @router.post("/webhook")
-async def receive(request: Request, background_tasks: BackgroundTasks):
-    body = await request.json()
-    background_tasks.add_task(process_webhook, body)
-    return {"status": "ok"}
+async def receive(request: Request):
+    body_bytes = await request.body()
 
-async def process_webhook(body: dict):
+    if APP_SECRET:
+        signature = request.headers.get("X-Hub-Signature-256", "")
+        expected = "sha256=" + hmac.new(
+            APP_SECRET.encode(), body_bytes, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            print(f"[webhook] Invalid signature")
+            return PlainTextResponse(content="Invalid signature", status_code=403)
+
+    import json
+    body = json.loads(body_bytes)
+    message = parse_message(body)
+    if not message:
+        return {"status": "ok"}
+
+    print(f"[webhook] Message from {message['from']}: {message['body'][:50]}")
+
     try:
-        message = parse_message(body)
-        if not message:
-            return
         await handle_incoming_message(
             customer_phone=message["from"],
             customer_name=message["name"],
             message_body=message["body"]
         )
     except Exception as e:
-        print(f"Error processing webhook: {e}")
+        print(f"[webhook] Error: {e}\n{traceback.format_exc()}")
+
+    return {"status": "ok"}
 ```
 
 ---

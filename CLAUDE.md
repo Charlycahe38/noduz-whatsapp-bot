@@ -206,13 +206,27 @@ async def verify_webhook(request: Request):
 ```
 
 ### POST /webhook — Receive Messages
+
+> ⚠️ CRITICAL — NEVER use BackgroundTasks on Vercel. Vercel freezes the serverless
+> process immediately after the response is returned. BackgroundTasks run after the
+> response, so they are silently killed. Always process the message synchronously
+> before returning 200. Meta's webhook timeout is 20 seconds — enough for Gemini.
+
 ```python
 @router.post("/webhook")
-async def receive_message(request: Request, background_tasks: BackgroundTasks):
-    body = await request.json()
+async def receive_message(request: Request):
+    body_bytes = await request.body()
+    body = json.loads(body_bytes)
 
-    # Always return 200 immediately — Meta retries otherwise
-    background_tasks.add_task(process_message, body)
+    message = parse_message(body)
+    if not message:
+        return {"status": "ok"}
+
+    await handle_incoming_message(
+        customer_phone=message["from"],
+        customer_name=message["name"],
+        message_body=message["body"]
+    )
     return {"status": "ok"}
 ```
 
@@ -225,7 +239,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
 import httpx
 
 async def send_whatsapp_message(phone_id: str, token: str, to: str, message: str):
-    url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
+    url = f"https://graph.facebook.com/v21.0/{phone_id}/messages"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
@@ -651,7 +665,7 @@ CLIENT_PROFILE.md
 ## CRITICAL RULES
 
 1. **ALL customer messages in Spanish** unless otherwise configured
-2. **ALWAYS return 200 OK immediately** on POST webhook — process in background
+2. **Process webhook synchronously on Vercel** — NEVER use BackgroundTasks (they get killed)
 3. **NEVER hardcode business data** — read from config/environment
 4. **ALWAYS check calendar before offering times** — never guess
 5. **Phone numbers stored as strings** with country code
