@@ -58,3 +58,26 @@ It serves as a running log of all changes, decisions, and context built up over 
 - Run `scripts/migrate_add_clients.sql` in Supabase SQL Editor for Family Barber (fill in real credentials before running).
 - Add `CLIENT_ID` env var in Vercel dashboard for the Family Barber deployment.
 - Future: update `ai_agent.py` to build system prompt dynamically from `clients` table row (currently still reads from hardcoded `config.py`).
+
+---
+
+## Session 3 — 2026-03-30
+
+### Bugs fixed
+- **Vercel background tasks killed**: `background_tasks.add_task()` in FastAPI is not reliable on Vercel serverless — the process is frozen after response is sent. Fixed by processing the webhook synchronously in `webhook.py` before returning 200.
+- **WhatsApp API version outdated**: Updated from v18.0 to v21.0 in `whatsapp.py`.
+- **Wrong WHATSAPP_PHONE_ID**: Old phone ID `1053080334546599` was in `.env`. Correct ID is `1082286704960206` — updated in `.env` and Vercel.
+- **Mexico phone number format**: WhatsApp API uses `521XXXXXXXXXX` (with `1` after country code) for Mexican mobile numbers. The allowed list in Meta must use this format (`+5214448023870`), not `524448013870`.
+- **Silent WhatsApp send failures**: Added logging to `send_message` to surface API errors with status code, response body, and recipient number.
+
+### Code changes
+- `api/webhook.py` — removed BackgroundTasks, process message synchronously; added logging for signature failures and incoming messages.
+- `api/whatsapp.py` — updated API version to v21.0; added error logging on send failure; added phone_id/token debug log.
+
+### Architecture notes
+- Bot is now fully working end-to-end for test numbers.
+- To message any number (real customers), WhatsApp Business Verification must be completed in Meta Business Manager to remove the test recipient restriction.
+
+### Pending / next steps
+- Complete WhatsApp Business Verification in Meta Business Manager to go fully live.
+- Remove debug logging (phone_id/token prefix) from `whatsapp.py` once confirmed stable.
