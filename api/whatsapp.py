@@ -16,7 +16,12 @@ async def send_message(to: str, message: str):
     }
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, json=payload, headers=headers)
-        return resp.json()
+        result = resp.json()
+        if resp.status_code != 200:
+            print(f"[whatsapp] Send failed {resp.status_code}: {result}")
+        else:
+            print(f"[whatsapp] Message sent to {to}: {resp.status_code}")
+        return result
 
 
 def parse_message(body: dict) -> dict | None:
