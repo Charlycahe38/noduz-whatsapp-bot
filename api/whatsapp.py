@@ -3,6 +3,7 @@ from api.config import WHATSAPP_TOKEN, WHATSAPP_PHONE_ID
 
 
 async def send_message(to: str, message: str):
+    print(f"[whatsapp] Using phone_id={WHATSAPP_PHONE_ID} token={WHATSAPP_TOKEN[:15]}...")
     url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
