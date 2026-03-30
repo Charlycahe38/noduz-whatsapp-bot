@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import traceback
 
-from fastapi import APIRouter, Request, BackgroundTasks
+from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
 
 from api.config import VERIFY_TOKEN, APP_SECRET
@@ -24,34 +24,36 @@ async def verify(request: Request):
 
 
 @router.post("/webhook")
-async def receive(request: Request, background_tasks: BackgroundTasks):
+async def receive(request: Request):
+    body_bytes = await request.body()
+
     # Validate X-Hub-Signature-256
     if APP_SECRET:
         signature = request.headers.get("X-Hub-Signature-256", "")
-        body_bytes = await request.body()
         expected = "sha256=" + hmac.new(
             APP_SECRET.encode(), body_bytes, hashlib.sha256
         ).hexdigest()
 
         if not hmac.compare_digest(signature, expected):
+            print(f"[webhook] Invalid signature. Got: {signature[:30]}... Expected: {expected[:30]}...")
             return PlainTextResponse(content="Invalid signature", status_code=403)
-        body = __import__("json").loads(body_bytes)
-    else:
-        body = await request.json()
 
-    background_tasks.add_task(process_webhook, body)
-    return {"status": "ok"}
+    import json
+    body = json.loads(body_bytes)
 
+    message = parse_message(body)
+    if not message:
+        return {"status": "ok"}
 
-async def process_webhook(body: dict):
+    print(f"[webhook] Message from {message['from']}: {message['body'][:50]}")
+
     try:
-        message = parse_message(body)
-        if not message:
-            return
         await handle_incoming_message(
             customer_phone=message["from"],
             customer_name=message["name"],
             message_body=message["body"]
         )
     except Exception as e:
-        print(f"Error processing webhook: {e}\n{traceback.format_exc()}")
+        print(f"[webhook] Error processing message: {e}\n{traceback.format_exc()}")
+
+    return {"status": "ok"}
