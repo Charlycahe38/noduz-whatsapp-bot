@@ -243,27 +243,44 @@ async def receive(request: Request):
 
 ## SKILL 6: Conversation Service
 
+> ⚠️ Always use `get_client_id()` from client_manager. NEVER upsert on `customer_phone` alone —
+> the DB unique constraint is `(client_id, customer_phone)`.
+
 ### api/conversation.py
 ```python
 import json
 from api.supabase_client import supabase
+from api.client_manager import get_client_id
 
 async def get_conversation(phone: str) -> list:
-    """Get conversation history for a customer"""
-    result = supabase.table("conversations").select("*").eq("customer_phone", phone).execute()
+    """Get conversation history for a customer scoped to this client."""
+    client_id = get_client_id()
+    result = (
+        supabase.table("conversations")
+        .select("*")
+        .eq("client_id", client_id)
+        .eq("customer_phone", phone)
+        .execute()
+    )
     if result.data:
-        return result.data[0].get("messages", [])
+        messages = result.data[0].get("messages", [])
+        if isinstance(messages, str):
+            messages = json.loads(messages)
+        return messages
     return []
 
 async def save_conversation(phone: str, name: str, messages: list):
-    """Upsert conversation history — keep last 20 messages"""
+    """Upsert conversation history — keep last 20 messages."""
+    client_id = get_client_id()
     trimmed = messages[-20:] if len(messages) > 20 else messages
-    supabase.table("conversations").upsert({
+    record = {
+        "client_id": client_id,
         "customer_phone": phone,
         "customer_name": name,
         "messages": json.dumps(trimmed),
-        "last_message_at": "now()"
-    }, on_conflict="customer_phone").execute()
+        "last_message_at": "now()",
+    }
+    supabase.table("conversations").upsert(record, on_conflict="client_id,customer_phone").execute()
 ```
 
 ---
@@ -402,10 +419,13 @@ def create_calendar_event(title: str, description: str, date_str: str,
 ### api/appointments.py
 ```python
 from api.supabase_client import supabase
+from api.client_manager import get_client_id
 
 async def save_appointment(data: dict) -> dict:
-    """Save appointment to Supabase"""
-    result = supabase.table("appointments").insert({
+    """Save appointment to Supabase."""
+    client_id = get_client_id()
+    record = {
+        "client_id": client_id,
         "customer_name": data["customer_name"],
         "customer_phone": data["customer_phone"],
         "service": data["service_name"],
@@ -415,8 +435,10 @@ async def save_appointment(data: dict) -> dict:
         "duration_minutes": data["duration_minutes"],
         "price": data["price"],
         "google_event_id": data.get("google_event_id", ""),
-        "status": "confirmed"
-    }).execute()
+        "notes": data.get("barber", ""),
+        "status": "confirmed",
+    }
+    result = supabase.table("appointments").insert(record).execute()
     return result.data[0] if result.data else {}
 ```
 
@@ -543,6 +565,82 @@ messages = [
 2. Test health: `curl http://localhost:5000/health`
 3. Test verify: `curl "http://localhost:5000/webhook?hub.mode=subscribe&hub.verify_token=noduz2026&hub.challenge=test123"`
 4. Should return: `test123`
+
+---
+
+## SKILL 13: Client Manager (Multi-tenant UUID resolver)
+
+Every deployment is linked to one row in the `clients` table via a UUID. This module
+resolves that UUID automatically so you never need to hardcode it.
+
+### api/client_manager.py
+```python
+"""
+Priority order:
+  1. CLIENT_ID env var (set in Vercel for production — fastest)
+  2. DB lookup by WHATSAPP_PHONE_ID (auto-discovery on cold start)
+  3. Auto-insert client row from config.py values (first-run setup)
+Result is cached module-level — one DB call per cold start max.
+"""
+import os
+
+_client_id_cache: str | None = None
+
+def get_client_id() -> str:
+    global _client_id_cache
+    if _client_id_cache:
+        return _client_id_cache
+
+    env_id = os.getenv("CLIENT_ID", "").strip()
+    if env_id:
+        _client_id_cache = env_id
+        return _client_id_cache
+
+    from api.supabase_client import supabase
+    from api.config import WHATSAPP_PHONE_ID
+    result = supabase.table("clients").select("id").eq("whatsapp_phone_id", WHATSAPP_PHONE_ID).execute()
+    if result.data:
+        _client_id_cache = result.data[0]["id"]
+        print(f"[client_manager] CLIENT_ID resolved from DB: {_client_id_cache}")
+        return _client_id_cache
+
+    # First run — create client row from config values
+    from api.config import (WHATSAPP_TOKEN, VERIFY_TOKEN, APP_SECRET, BUSINESS_NAME,
+        BUSINESS_TYPE, BUSINESS_LOCATION, GEMINI_API_KEY, GOOGLE_CALENDAR_ID,
+        GOOGLE_SERVICE_ACCOUNT_JSON, TIMEZONE, WORKING_DAYS, BUSINESS_START_HOUR,
+        BUSINESS_END_HOUR, BREAK_START_HOUR, BREAK_END_HOUR, SLOT_INCREMENT,
+        SERVICES, BARBERS, BOT_LANGUAGE, BOT_GREETING_EXAMPLE,
+        CANCELLATION_POLICY, POST_CONFIRMATION_MESSAGE, DEPOSIT_REQUIRED)
+    record = {
+        "business_name": BUSINESS_NAME, "business_type": BUSINESS_TYPE,
+        "business_location": BUSINESS_LOCATION, "whatsapp_phone_id": WHATSAPP_PHONE_ID,
+        "whatsapp_token": WHATSAPP_TOKEN, "verify_token": VERIFY_TOKEN,
+        "app_secret": APP_SECRET, "gemini_api_key": GEMINI_API_KEY,
+        "google_calendar_id": GOOGLE_CALENDAR_ID,
+        "google_service_account_json": GOOGLE_SERVICE_ACCOUNT_JSON,
+        "timezone": TIMEZONE, "working_days": WORKING_DAYS,
+        "business_start_hour": BUSINESS_START_HOUR, "business_end_hour": BUSINESS_END_HOUR,
+        "break_start_hour": BREAK_START_HOUR, "break_end_hour": BREAK_END_HOUR,
+        "slot_increment": SLOT_INCREMENT, "services": SERVICES, "barbers": BARBERS,
+        "bot_language": BOT_LANGUAGE, "bot_greeting": BOT_GREETING_EXAMPLE,
+        "cancellation_policy": CANCELLATION_POLICY,
+        "post_confirmation_message": POST_CONFIRMATION_MESSAGE,
+        "deposit_required": DEPOSIT_REQUIRED,
+    }
+    create_result = supabase.table("clients").insert(record).execute()
+    if not create_result.data:
+        raise RuntimeError("[client_manager] Failed to create client row in Supabase")
+    _client_id_cache = create_result.data[0]["id"]
+    print(f"[client_manager] Created new client row: {_client_id_cache} — set CLIENT_ID={_client_id_cache} in Vercel env vars.")
+    return _client_id_cache
+```
+
+### After first deploy — backfill existing data:
+```sql
+-- Run in Supabase SQL Editor after getting the UUID from Vercel logs
+UPDATE conversations SET client_id = '<uuid>' WHERE client_id IS NULL;
+UPDATE appointments  SET client_id = '<uuid>' WHERE client_id IS NULL;
+```
 
 ---
 

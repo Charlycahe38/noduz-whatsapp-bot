@@ -81,3 +81,33 @@ It serves as a running log of all changes, decisions, and context built up over 
 ### Pending / next steps
 - Complete WhatsApp Business Verification in Meta Business Manager to go fully live.
 - Remove debug logging (phone_id/token prefix) from `whatsapp.py` once confirmed stable.
+
+---
+
+## Session 4 — 2026-03-31
+
+### Bugs fixed
+- **Conversations and appointments had no client_id**: `CLIENT_ID` env var was never set in `.env` or Vercel. The old code had a fallback that omitted `client_id` from records and fell back to `on_conflict="customer_phone"`. The DB constraint is `UNIQUE(client_id, customer_phone)` — not unique on `customer_phone` alone. Result: every message inserted a new orphan row with `client_id = NULL` instead of upserting, so conversation history was never loaded and the bot had no memory.
+
+### Architecture decisions
+- `client_manager.py` resolves CLIENT_ID in priority order: (1) env var, (2) DB lookup by WHATSAPP_PHONE_ID, (3) auto-create client row from config.py on first run. Cached module-level — one DB round-trip per cold start max.
+- Removed all "no CLIENT_ID" fallback paths from conversation.py, appointments.py, dashboard.py. client_id is now always required and always present.
+
+### New files
+- `api/client_manager.py` — auto-resolves and caches the CLIENT_ID UUID.
+
+### Code changes
+- `api/conversation.py` — always uses `get_client_id()`, upsert always on `client_id,customer_phone`.
+- `api/appointments.py` — always includes `client_id` in inserts via `get_client_id()`.
+- `api/dashboard.py` — always filters by `client_id` via `get_client_id()`.
+- `SKILLS.md` — updated Skill 6 and Skill 9 code snippets; added Skill 13 (client_manager).
+- `.env` — added `CLIENT_ID=` placeholder with explanation comment.
+
+### Pending / next steps
+- After deploying, check Vercel logs for `[client_manager] Created new client row: <uuid>`.
+- Run in Supabase SQL Editor to backfill existing demo data (DO NOT delete — needed for sales demos):
+  ```sql
+  UPDATE conversations SET client_id = '<uuid>' WHERE client_id IS NULL;
+  UPDATE appointments  SET client_id = '<uuid>' WHERE client_id IS NULL;
+  ```
+- Set `CLIENT_ID=<uuid>` in Vercel env vars to skip the DB lookup on cold starts.
