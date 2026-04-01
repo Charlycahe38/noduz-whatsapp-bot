@@ -1,10 +1,12 @@
 from api.supabase_client import supabase
-from api.config import CLIENT_ID
+from api.client_manager import get_client_id
 
 
 async def save_appointment(data: dict) -> dict:
     """Save appointment to Supabase."""
+    client_id = get_client_id()
     record = {
+        "client_id": client_id,
         "customer_name": data["customer_name"],
         "customer_phone": data["customer_phone"],
         "service": data["service_name"],
@@ -15,9 +17,7 @@ async def save_appointment(data: dict) -> dict:
         "price": data["price"],
         "google_event_id": data.get("google_event_id", ""),
         "notes": data.get("barber", ""),
-        "status": "confirmed"
+        "status": "confirmed",
     }
-    if CLIENT_ID:
-        record["client_id"] = CLIENT_ID
     result = supabase.table("appointments").insert(record).execute()
     return result.data[0] if result.data else {}

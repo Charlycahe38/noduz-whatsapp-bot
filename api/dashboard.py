@@ -2,18 +2,19 @@ import json
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse
 from api.supabase_client import supabase
-from api.config import CLIENT_ID, BUSINESS_NAME
+from api.config import BUSINESS_NAME
+from api.client_manager import get_client_id
 
 router = APIRouter()
 
 
 @router.get("/api/conversations")
 async def get_conversations():
+    client_id = get_client_id()
     query = supabase.table("conversations") \
         .select("customer_phone, customer_name, messages, last_message_at") \
+        .eq("client_id", client_id) \
         .order("last_message_at", desc=True)
-    if CLIENT_ID:
-        query = query.eq("client_id", CLIENT_ID)
     result = query.execute()
     rows = []
     for r in result.data:
@@ -38,11 +39,11 @@ async def get_conversations():
 
 @router.get("/api/appointments")
 async def get_appointments():
+    client_id = get_client_id()
     query = supabase.table("appointments") \
         .select("*") \
+        .eq("client_id", client_id) \
         .order("appointment_date", desc=True)
-    if CLIENT_ID:
-        query = query.eq("client_id", CLIENT_ID)
     result = query.execute()
     return JSONResponse(content=result.data)
 
