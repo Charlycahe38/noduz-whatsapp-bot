@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from api.supabase_client import supabase
 from api.client_manager import get_client_id
 
@@ -29,7 +30,7 @@ async def save_conversation(phone: str, name: str, messages: list):
         "client_id": client_id,
         "customer_phone": phone,
         "customer_name": name,
-        "messages": json.dumps(trimmed),
-        "last_message_at": "now()",
+        "messages": trimmed,
+        "last_message_at": datetime.now(timezone.utc).isoformat(),
     }
     supabase.table("conversations").upsert(record, on_conflict="client_id,customer_phone").execute()
