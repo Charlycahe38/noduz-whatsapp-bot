@@ -715,6 +715,37 @@ This file is the project's memory. Future sessions should read it first to under
 
 ---
 
+## Session 5 — 2026-04-21
+
+### Architecture decisions
+- Replaced `upsert(on_conflict=...)` with an explicit select → update-or-insert pattern in `save_conversation`. This removes the dependency on the `UNIQUE(client_id, customer_phone)` constraint existing in production, which was fragile.
+- Isolated `save_conversation` in its own try/except inside `handle_incoming_message` so a DB persistence failure never causes the user-facing error message to fire after a successful AI response.
+
+### DB changes
+None — no schema changes. The fix is purely in application code.
+
+### Code changes
+- **`api/conversation.py`**:
+  - `save_conversation`: changed `"last_message_at": "now()"` → `datetime.now(timezone.utc).isoformat()` (valid ISO 8601 string)
+  - `save_conversation`: changed `"messages": json.dumps(trimmed)` → `"messages": trimmed` (pass list directly to JSONB column)
+  - `save_conversation`: replaced `upsert(on_conflict=...)` with explicit select → update/insert
+- **`api/ai_agent.py`**:
+  - Wrapped `save_conversation` call in isolated try/except with detailed log output
+  - Changed outer exception log prefix from `handle_incoming_message error` to `[ai_agent] handle_incoming_message error` for easier filtering
+
+### New files
+None.
+
+### Bugs fixed
+**Double-message bug:** every bot reply was followed by "⚠️ Hubo un error inesperado". Root cause: `save_conversation` was throwing after `send_message` succeeded (due to invalid `"now()"` timestamptz string and/or upsert constraint failure), and the outer `except` was sending the error message to the customer even though the AI response had already been delivered correctly.
+
+### Pending
+- Confirm the fix is working in production (test via WhatsApp after deploy)
+- If `[ai_agent] save_conversation FAILED:` still appears in Vercel logs, check Supabase for schema issues (missing `UNIQUE(client_id, customer_phone)` constraint or RLS blocking writes)
+- Consider adding a `/debug` endpoint that runs a test DB write and reports success/failure without touching WhatsApp
+
+---
+
 ## WHAT SUCCESS LOOKS LIKE
 
 1. `git push` deploys to Vercel automatically

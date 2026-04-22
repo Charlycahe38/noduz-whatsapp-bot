@@ -245,10 +245,17 @@ async def receive(request: Request):
 
 > ⚠️ Always use `get_client_id()` from client_manager. NEVER upsert on `customer_phone` alone —
 > the DB unique constraint is `(client_id, customer_phone)`.
+>
+> ⚠️ THREE BUGS to avoid in save_conversation (all caused the double-message error):
+> 1. NEVER pass `"now()"` as a string for TIMESTAMPTZ — use `datetime.now(timezone.utc).isoformat()`
+> 2. NEVER pass `json.dumps(list)` to a JSONB column — pass the Python list directly
+> 3. NEVER use `upsert(on_conflict=...)` — use explicit select → update-or-insert instead,
+>    because the unique constraint may not exist in production and upsert will silently fail
 
 ### api/conversation.py
 ```python
 import json
+from datetime import datetime, timezone
 from api.supabase_client import supabase
 from api.client_manager import get_client_id
 
@@ -270,17 +277,33 @@ async def get_conversation(phone: str) -> list:
     return []
 
 async def save_conversation(phone: str, name: str, messages: list):
-    """Upsert conversation history — keep last 20 messages."""
+    """Save conversation history — keep last 20 messages. Uses update-or-insert pattern."""
     client_id = get_client_id()
     trimmed = messages[-20:] if len(messages) > 20 else messages
-    record = {
-        "client_id": client_id,
-        "customer_phone": phone,
-        "customer_name": name,
-        "messages": json.dumps(trimmed),
-        "last_message_at": "now()",
-    }
-    supabase.table("conversations").upsert(record, on_conflict="client_id,customer_phone").execute()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    existing = (
+        supabase.table("conversations")
+        .select("id")
+        .eq("client_id", client_id)
+        .eq("customer_phone", phone)
+        .execute()
+    )
+
+    if existing.data:
+        supabase.table("conversations").update({
+            "customer_name": name,
+            "messages": trimmed,
+            "last_message_at": now_iso,
+        }).eq("client_id", client_id).eq("customer_phone", phone).execute()
+    else:
+        supabase.table("conversations").insert({
+            "client_id": client_id,
+            "customer_phone": phone,
+            "customer_name": name,
+            "messages": trimmed,
+            "last_message_at": now_iso,
+        }).execute()
 ```
 
 ---
@@ -651,4 +674,16 @@ UPDATE appointments  SET client_id = '<uuid>' WHERE client_id IS NULL;
 - Send friendly error message to customer: "⚠️ Hubo un error. Por favor intenta de nuevo."
 - Never let Gemini API errors crash the webhook
 - If Google Calendar fails, tell customer "No pude verificar disponibilidad, intenta en unos minutos."
-- If Supabase fails, still try to respond via WhatsApp with a generic message
+- **CRITICAL: Wrap `save_conversation` in its own try/except, separate from the main handler.**
+  If the DB save fails AFTER `send_message` succeeded, the outer `except` would send the
+  error message to the customer even though the AI response was delivered correctly.
+  Pattern:
+  ```python
+  await send_message(customer_phone, final_text)
+  history.append({"role": "model", "parts": [{"text": final_text}]})
+  try:
+      await save_conversation(customer_phone, customer_name, history)
+  except Exception as save_err:
+      print(f"[ai_agent] save_conversation FAILED: {save_err}\n{traceback.format_exc()}")
+  # DO NOT re-raise — message was already delivered successfully
+  ```
