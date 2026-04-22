@@ -220,9 +220,11 @@ async def execute_tool(tool_name: str, args: dict) -> str:
 
 
 async def handle_incoming_message(customer_phone: str, customer_name: str, message_body: str):
+    print(f"[ai_agent] START handle_incoming_message phone={customer_phone} msg={message_body[:40]!r}")
     try:
         # Load history
         history = await get_conversation(customer_phone)
+        print(f"[ai_agent] history loaded: {len(history)} messages")
 
         # Append new user message
         history.append({"role": "user", "parts": [{"text": message_body}]})
@@ -239,16 +241,27 @@ async def handle_incoming_message(customer_phone: str, customer_name: str, messa
                 parts=[types.Part(text=text)]
             ))
 
+        print(f"[ai_agent] calling Gemini with {len(contents)} content(s)")
         # Call Gemini
-        response = client.models.generate_content(
-            model="models/gemini-2.5-flash",
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                tools=TOOL_DEFINITIONS,
-                temperature=0.7
+        try:
+            response = client.models.generate_content(
+                model="models/gemini-2.5-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    tools=TOOL_DEFINITIONS,
+                    temperature=0.7
+                )
             )
-        )
+        except Exception as gemini_err:
+            err_str = str(gemini_err)
+            print(f"[ai_agent] Gemini error: {gemini_err}\n{traceback.format_exc()}")
+            if "429" in err_str or "quota" in err_str.lower() or "exhausted" in err_str.lower():
+                await send_message(customer_phone, "Estoy procesando muchas solicitudes a la vez, espera un momento e intenta de nuevo. 🙏")
+            else:
+                await send_message(customer_phone, "⚠️ Hubo un error al procesar tu mensaje. Por favor intenta de nuevo.")
+            return
+        print(f"[ai_agent] Gemini responded, candidates={len(response.candidates)}")
 
         # Handle tool calls in a loop
         max_iterations = 5
@@ -303,9 +316,12 @@ async def handle_incoming_message(customer_phone: str, customer_name: str, messa
 
         # Extract final text response
         final_text = ""
-        for part in response.candidates[0].content.parts:
-            if part.text:
-                final_text += part.text
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if part.text:
+                    final_text += part.text
+        else:
+            print(f"[ai_agent] WARNING: empty candidates or content. finish_reason={response.candidates[0].finish_reason if response.candidates else 'NO_CANDIDATES'}")
 
         if not final_text:
             final_text = "Disculpa, hubo un problema. Por favor intenta de nuevo."
