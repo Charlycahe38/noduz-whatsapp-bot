@@ -219,6 +219,35 @@ async def execute_tool(tool_name: str, args: dict) -> str:
     return "Herramienta no reconocida."
 
 
+GEMINI_MODEL = "models/gemini-2.0-flash"
+
+
+async def _gemini_call(contents, system_prompt, max_retries: int = 4):
+    """Call Gemini with exponential backoff on rate limit errors (429)."""
+    import asyncio
+    delay = 2
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    tools=TOOL_DEFINITIONS,
+                    temperature=0.7
+                )
+            )
+        except Exception as e:
+            err_str = str(e)
+            is_rate_limit = "429" in err_str or "quota" in err_str.lower() or "exhausted" in err_str.lower()
+            if is_rate_limit and attempt < max_retries - 1:
+                print(f"[ai_agent] Gemini rate limit hit, retry {attempt + 1}/{max_retries - 1} in {delay}s")
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                raise
+
+
 async def handle_incoming_message(customer_phone: str, customer_name: str, message_body: str):
     print(f"[ai_agent] START handle_incoming_message phone={customer_phone} msg={message_body[:40]!r}")
     try:
@@ -242,25 +271,7 @@ async def handle_incoming_message(customer_phone: str, customer_name: str, messa
             ))
 
         print(f"[ai_agent] calling Gemini with {len(contents)} content(s)")
-        # Call Gemini
-        try:
-            response = client.models.generate_content(
-                model="models/gemini-2.5-flash",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    tools=TOOL_DEFINITIONS,
-                    temperature=0.7
-                )
-            )
-        except Exception as gemini_err:
-            err_str = str(gemini_err)
-            print(f"[ai_agent] Gemini error: {gemini_err}\n{traceback.format_exc()}")
-            if "429" in err_str or "quota" in err_str.lower() or "exhausted" in err_str.lower():
-                await send_message(customer_phone, "Estoy procesando muchas solicitudes a la vez, espera un momento e intenta de nuevo. 🙏")
-            else:
-                await send_message(customer_phone, "⚠️ Hubo un error al procesar tu mensaje. Por favor intenta de nuevo.")
-            return
+        response = await _gemini_call(contents, system_prompt)
         print(f"[ai_agent] Gemini responded, candidates={len(response.candidates)}")
 
         # Handle tool calls in a loop
@@ -304,15 +315,7 @@ async def handle_incoming_message(customer_phone: str, customer_name: str, messa
                 parts=tool_results
             ))
 
-            response = client.models.generate_content(
-                model="models/gemini-2.5-flash",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    tools=TOOL_DEFINITIONS,
-                    temperature=0.7
-                )
-            )
+            response = await _gemini_call(contents, system_prompt)
 
         # Extract final text response
         final_text = ""
