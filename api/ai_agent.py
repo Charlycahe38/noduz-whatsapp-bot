@@ -313,12 +313,15 @@ async def handle_incoming_message(customer_phone: str, customer_name: str, messa
         # Send WhatsApp message
         await send_message(customer_phone, final_text)
 
-        # Save updated conversation
+        # Save updated conversation — isolated so a save failure never shows error to user
         history.append({"role": "model", "parts": [{"text": final_text}]})
-        await save_conversation(customer_phone, customer_name, history)
+        try:
+            await save_conversation(customer_phone, customer_name, history)
+        except Exception as save_err:
+            print(f"[ai_agent] save_conversation FAILED: {save_err}\n{traceback.format_exc()}")
 
     except Exception as e:
-        print(f"handle_incoming_message error: {e}\n{traceback.format_exc()}")
+        print(f"[ai_agent] handle_incoming_message error: {e}\n{traceback.format_exc()}")
         try:
             await send_message(
                 customer_phone,
