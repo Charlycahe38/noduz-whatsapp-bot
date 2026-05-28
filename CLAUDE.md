@@ -715,6 +715,40 @@ This file is the project's memory. Future sessions should read it first to under
 
 ---
 
+## Session 6 — 2026-05-27
+
+### Architecture decisions
+- Added a traffic-control layer around the AI: per-customer message queue + processing lock, both stored in Supabase (required because Vercel serverless has no shared in-process memory between requests).
+- Per-customer lock uses a conditional UPDATE (`WHERE processing_lock = FALSE`) which Postgres serializes atomically — only one concurrent Vercel function wins per customer.
+- Debounce window (2s): the lock holder sleeps briefly so burst messages from the same customer accumulate before the AI call, turning N rapid messages into 1 combined request.
+- Stale-lock steal: if a Vercel function crashes while holding the lock, the lock is reclaimed after 55 seconds (just under the 60s Vercel function timeout).
+- The loop at the end of `handle_incoming_message` ensures messages that arrive *during* an AI call are picked up immediately, without requiring a new webhook to trigger.
+
+### DB changes
+- `ALTER TABLE conversations ADD COLUMN processing_lock BOOLEAN DEFAULT FALSE`
+- `ALTER TABLE conversations ADD COLUMN lock_acquired_at TIMESTAMPTZ`
+- `CREATE TABLE message_queue (id, client_id, customer_phone, customer_name, message_body, received_at, processed)`
+- Run `scripts/migrate_message_queue.sql` in Supabase SQL Editor before deploying.
+
+### Code changes
+- **`api/message_buffer.py`** (new): enqueue_message, try_acquire_lock, release_lock, flush_pending_messages, has_pending_messages, combine_messages
+- **`api/ai_agent.py`**: added imports from message_buffer; extracted core AI logic into `_run_ai_for_message`; rewrote `handle_incoming_message` to use the queue/lock/debounce pattern
+
+### New files
+- `api/message_buffer.py` — traffic-control primitives
+- `scripts/migrate_message_queue.sql` — DB migration to run before deploying
+
+### Bugs fixed
+Message-rate issue: customer sending multiple quick messages triggered multiple concurrent AI calls, producing confused responses and hitting Gemini free-tier rate limits. Root cause: no coordination between concurrent webhook invocations. Fix: Supabase-backed queue + per-customer lock ensures only one AI call is active per customer at a time, and burst messages are combined into a single request.
+
+### Pending
+- Run `scripts/migrate_message_queue.sql` in Supabase before next deploy.
+- Test: send 4 rapid messages from same number, confirm only 1 AI response arrives.
+- Optional future: periodic cleanup job for processed message_queue rows older than 7 days.
+- Optional future: for very high volume (50+ simultaneous customers), add a global concurrency counter in Supabase to cap total concurrent AI calls.
+
+---
+
 ## Session 5 — 2026-04-21
 
 ### Architecture decisions

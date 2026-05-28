@@ -1,3 +1,4 @@
+import asyncio
 import json
 import traceback
 from datetime import date
@@ -11,6 +12,15 @@ from api.conversation import get_conversation, save_conversation
 from api.whatsapp import send_message
 from api.calendar_service import find_available_slots, create_calendar_event
 from api.appointments import save_appointment
+from api.message_buffer import (
+    DEBOUNCE_SECONDS,
+    combine_messages,
+    enqueue_message,
+    flush_pending_messages,
+    has_pending_messages,
+    release_lock,
+    try_acquire_lock,
+)
 
 client = genai.Client(api_key=config.GEMINI_API_KEY)
 
@@ -224,7 +234,6 @@ GEMINI_MODEL = "models/gemini-2.0-flash"
 
 async def _gemini_call(contents, system_prompt, max_retries: int = 4):
     """Call Gemini with exponential backoff on rate limit errors (429)."""
-    import asyncio
     delay = 2
     for attempt in range(max_retries):
         try:
@@ -248,103 +257,143 @@ async def _gemini_call(contents, system_prompt, max_retries: int = 4):
                 raise
 
 
-async def handle_incoming_message(customer_phone: str, customer_name: str, message_body: str):
-    print(f"[ai_agent] START handle_incoming_message phone={customer_phone} msg={message_body[:40]!r}")
-    try:
-        # Load history
-        history = await get_conversation(customer_phone)
-        print(f"[ai_agent] history loaded: {len(history)} messages")
+async def _run_ai_for_message(customer_phone: str, customer_name: str, message_text: str):
+    """
+    Core AI pipeline for a single (possibly combined) message.
+    Loads conversation history, calls Gemini, handles tool loops, sends reply, saves history.
+    The caller is responsible for buffering/locking — this function does not know about those.
+    """
+    history = await get_conversation(customer_phone)
+    print(f"[ai_agent] history loaded: {len(history)} messages for {customer_phone}")
 
-        # Append new user message
-        history.append({"role": "user", "parts": [{"text": message_body}]})
+    history.append({"role": "user", "parts": [{"text": message_text}]})
+    system_prompt = build_system_prompt()
 
-        system_prompt = build_system_prompt()
+    contents = []
+    for msg in history:
+        role = msg["role"]
+        text = msg["parts"][0]["text"] if msg.get("parts") else ""
+        contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
 
-        # Convert history to genai Contents format
-        contents = []
-        for msg in history:
-            role = msg["role"]
-            text = msg["parts"][0]["text"] if msg.get("parts") else ""
-            contents.append(types.Content(
-                role=role,
-                parts=[types.Part(text=text)]
+    print(f"[ai_agent] calling Gemini ({len(contents)} turns) for {customer_phone}")
+    response = await _gemini_call(contents, system_prompt)
+    print(f"[ai_agent] Gemini responded, candidates={len(response.candidates)}")
+
+    # Tool-call loop — Gemini may request calendar checks or appointment creation
+    max_iterations = 5
+    for _ in range(max_iterations):
+        candidate = response.candidates[0]
+        parts = candidate.content.parts
+        function_calls = [p for p in parts if p.function_call]
+
+        if not function_calls:
+            break
+
+        tool_results = []
+        for part in function_calls:
+            fc = part.function_call
+            print(f"[ai_agent] tool call: {fc.name}({dict(fc.args)})")
+            result = await execute_tool(fc.name, dict(fc.args))
+            print(f"[ai_agent] tool result: {result[:80]}")
+            tool_results.append(types.Part(
+                function_response=types.FunctionResponse(
+                    name=fc.name,
+                    response={"result": result}
+                )
             ))
 
-        print(f"[ai_agent] calling Gemini with {len(contents)} content(s)")
+        contents.append(types.Content(role="model", parts=parts))
+        contents.append(types.Content(role="user", parts=tool_results))
         response = await _gemini_call(contents, system_prompt)
-        print(f"[ai_agent] Gemini responded, candidates={len(response.candidates)}")
 
-        # Handle tool calls in a loop
-        max_iterations = 5
-        for _ in range(max_iterations):
-            candidate = response.candidates[0]
-            parts = candidate.content.parts
+    final_text = ""
+    if response.candidates and response.candidates[0].content:
+        for part in response.candidates[0].content.parts:
+            if part.text:
+                final_text += part.text
+    else:
+        finish = response.candidates[0].finish_reason if response.candidates else "NO_CANDIDATES"
+        print(f"[ai_agent] WARNING: empty response. finish_reason={finish}")
 
-            # Check if there are function calls
-            function_calls = [p for p in parts if p.function_call]
+    if not final_text:
+        final_text = "Disculpa, hubo un problema. Por favor intenta de nuevo."
 
-            if not function_calls:
-                # No more tool calls — get the final text
-                break
+    await send_message(customer_phone, final_text)
 
-            # Execute each tool call
-            tool_results = []
-            for part in function_calls:
-                fc = part.function_call
-                tool_name = fc.name
-                tool_args = dict(fc.args)
+    history.append({"role": "model", "parts": [{"text": final_text}]})
+    try:
+        await save_conversation(customer_phone, customer_name, history)
+    except Exception as save_err:
+        print(f"[ai_agent] save_conversation FAILED: {save_err}\n{traceback.format_exc()}")
 
-                print(f"Tool call: {tool_name}({tool_args})")
-                result = await execute_tool(tool_name, tool_args)
-                print(f"Tool result: {result}")
 
-                tool_results.append(types.Part(
-                    function_response=types.FunctionResponse(
-                        name=tool_name,
-                        response={"result": result}
+async def handle_incoming_message(customer_phone: str, customer_name: str, message_body: str):
+    """
+    Traffic-control entry point for every incoming WhatsApp message.
+
+    Flow:
+      1. Save the message to the Supabase queue immediately (never lose a message).
+      2. Try to acquire the per-customer processing lock.
+         - If the lock is taken: return immediately — the lock holder will pick up
+           this message after its current AI call finishes.
+         - If the lock is acquired: become the processor for this customer.
+      3. Debounce: sleep briefly so any burst messages pile into the queue.
+      4. Flush all pending messages, combine them, call the AI once.
+      5. After the AI responds, check if more messages arrived during step 4.
+         If yes, loop back to step 3 and process the next batch.
+      6. Release the lock when the queue is empty.
+
+    This ensures:
+      - A customer sending 4 rapid messages triggers 1 AI call, not 4.
+      - Responses always arrive in order (one active AI call per customer).
+      - A crashed function never permanently blocks a customer (stale-lock steal).
+      - Rate-limit errors are retried with backoff, hidden from the customer.
+    """
+    print(f"[ai_agent] incoming phone={customer_phone} msg={message_body[:40]!r}")
+
+    # Step 1: persist the message before doing anything else
+    await enqueue_message(customer_phone, customer_name, message_body)
+
+    # Step 2: try to become the processor for this customer
+    lock_acquired = await try_acquire_lock(customer_phone)
+    if not lock_acquired:
+        print(f"[ai_agent] {customer_phone} already being processed — message queued")
+        return
+
+    print(f"[ai_agent] lock acquired for {customer_phone}")
+    try:
+        while True:
+            # Step 3: debounce — let message bursts accumulate
+            await asyncio.sleep(DEBOUNCE_SECONDS)
+
+            # Step 4: grab everything that arrived during the debounce window
+            messages = await flush_pending_messages(customer_phone)
+            if not messages:
+                break  # queue was drained by another cycle; we're done
+
+            combined = combine_messages(messages)
+            actual_name = messages[-1].get("customer_name") or customer_name
+            count = len(messages)
+            print(f"[ai_agent] processing {count} message(s) for {customer_phone}: {combined[:60]!r}")
+
+            try:
+                await _run_ai_for_message(customer_phone, actual_name, combined)
+            except Exception as e:
+                print(f"[ai_agent] AI error for {customer_phone}: {e}\n{traceback.format_exc()}")
+                try:
+                    await send_message(
+                        customer_phone,
+                        "Dame un momento, estoy teniendo dificultades técnicas. Intenta de nuevo en unos segundos."
                     )
-                ))
+                except Exception:
+                    pass
 
-            # Feed tool results back
-            contents.append(types.Content(
-                role="model",
-                parts=parts
-            ))
-            contents.append(types.Content(
-                role="user",
-                parts=tool_results
-            ))
+            # Step 5: check for messages that arrived while AI was thinking
+            if not await has_pending_messages(customer_phone):
+                break
+            print(f"[ai_agent] new messages found for {customer_phone} — looping")
 
-            response = await _gemini_call(contents, system_prompt)
-
-        # Extract final text response
-        final_text = ""
-        if response.candidates and response.candidates[0].content:
-            for part in response.candidates[0].content.parts:
-                if part.text:
-                    final_text += part.text
-        else:
-            print(f"[ai_agent] WARNING: empty candidates or content. finish_reason={response.candidates[0].finish_reason if response.candidates else 'NO_CANDIDATES'}")
-
-        if not final_text:
-            final_text = "Disculpa, hubo un problema. Por favor intenta de nuevo."
-
-        # Send WhatsApp message
-        await send_message(customer_phone, final_text)
-
-        # Save updated conversation — isolated so a save failure never shows error to user
-        history.append({"role": "model", "parts": [{"text": final_text}]})
-        try:
-            await save_conversation(customer_phone, customer_name, history)
-        except Exception as save_err:
-            print(f"[ai_agent] save_conversation FAILED: {save_err}\n{traceback.format_exc()}")
-
-    except Exception as e:
-        print(f"[ai_agent] handle_incoming_message error: {e}\n{traceback.format_exc()}")
-        try:
-            await send_message(
-                customer_phone,
-                "⚠️ Hubo un error inesperado. Por favor intenta de nuevo en un momento."
-            )
-        except Exception:
-            pass
+    finally:
+        # Step 6: always release the lock, even on unexpected errors
+        await release_lock(customer_phone)
+        print(f"[ai_agent] lock released for {customer_phone}")

@@ -4,16 +4,19 @@
 
 1. Project scaffolding (files, .env, vercel.json, requirements.txt, .gitignore)
 2. Config module (load env vars)
-3. Supabase client + SQL setup script
+3. Supabase client + SQL setup script (includes message_queue table)
 4. WhatsApp client (send messages + parse incoming)
 5. Webhook handlers (GET verify + POST receive)
 6. Conversation service (load/save from Supabase)
 7. Date parser (Spanish dates)
 8. Google Calendar service (check availability + create events)
-9. AI Agent (Gemini with tools)
-10. Wire everything together in index.py
-11. Test script
-12. Git + Vercel deployment config
+9. Appointments service (save confirmed bookings)
+10. **Message Buffer — traffic-control layer (queue + per-customer lock)**
+11. AI Agent (Gemini with tools — uses message buffer)
+12. Wire everything together in index.py
+13. Client Manager (multi-tenant UUID resolver)
+14. Test script
+15. Git + Vercel deployment config
 
 ---
 
@@ -110,7 +113,7 @@ SLOT_INCREMENT = 30
 
 ---
 
-## SKILL 3: Supabase Client
+## SKILL 3: Supabase Client + Schema
 
 ### api/supabase_client.py
 ```python
@@ -119,6 +122,107 @@ from api.config import SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 ```
+
+### SQL to run in Supabase SQL Editor (scripts/setup_supabase.sql)
+
+```sql
+-- Conversations: chat history + per-customer processing lock
+CREATE TABLE conversations (
+    id                 UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
+    client_id          TEXT        NOT NULL,
+    customer_phone     TEXT        NOT NULL,
+    customer_name      TEXT        DEFAULT 'Cliente',
+    messages           JSONB       DEFAULT '[]'::jsonb,
+    last_message_at    TIMESTAMPTZ DEFAULT NOW(),
+    created_at         TIMESTAMPTZ DEFAULT NOW(),
+    -- Traffic-control columns (required for message_buffer.py)
+    processing_lock    BOOLEAN     DEFAULT FALSE,
+    lock_acquired_at   TIMESTAMPTZ
+);
+
+-- Message queue: every incoming message is saved here before AI processing
+-- Enables burst buffering, per-customer locking, and zero message loss
+CREATE TABLE message_queue (
+    id              UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
+    client_id       TEXT        NOT NULL,
+    customer_phone  TEXT        NOT NULL,
+    customer_name   TEXT        DEFAULT 'Cliente',
+    message_body    TEXT        NOT NULL,
+    received_at     TIMESTAMPTZ DEFAULT NOW(),
+    processed       BOOLEAN     DEFAULT FALSE
+);
+
+-- Appointments: confirmed bookings
+CREATE TABLE appointments (
+    id                 UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
+    client_id          TEXT        NOT NULL,
+    customer_name      TEXT        NOT NULL,
+    customer_phone     TEXT        NOT NULL,
+    service            TEXT        NOT NULL,
+    appointment_date   DATE        NOT NULL,
+    start_time         TIME        NOT NULL,
+    end_time           TIME        NOT NULL,
+    duration_minutes   INTEGER     NOT NULL,
+    price              DECIMAL(10,2) NOT NULL,
+    currency           TEXT        DEFAULT 'MXN',
+    google_event_id    TEXT,
+    barber             TEXT,
+    status             TEXT        DEFAULT 'confirmed',
+    notes              TEXT,
+    created_at         TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Clients: one row per deployed bot instance (multi-tenant)
+CREATE TABLE clients (
+    id                          UUID  DEFAULT gen_random_uuid() PRIMARY KEY,
+    business_name               TEXT,
+    business_type               TEXT,
+    business_location           TEXT,
+    whatsapp_phone_id           TEXT  UNIQUE,
+    whatsapp_token              TEXT,
+    verify_token                TEXT,
+    app_secret                  TEXT,
+    gemini_api_key              TEXT,
+    google_calendar_id          TEXT  DEFAULT 'primary',
+    google_service_account_json TEXT,
+    timezone                    TEXT  DEFAULT 'America/Mexico_City',
+    working_days                TEXT,
+    business_start_hour         INTEGER DEFAULT 9,
+    business_end_hour           INTEGER DEFAULT 20,
+    break_start_hour            INTEGER,
+    break_end_hour              INTEGER,
+    slot_increment              INTEGER DEFAULT 30,
+    services                    JSONB   DEFAULT '[]'::jsonb,
+    barbers                     JSONB   DEFAULT '[]'::jsonb,
+    bot_language                TEXT,
+    bot_greeting                TEXT,
+    cancellation_policy         TEXT,
+    post_confirmation_message   TEXT,
+    deposit_required            BOOLEAN DEFAULT FALSE,
+    created_at                  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes
+CREATE INDEX idx_conversations_client_phone ON conversations(client_id, customer_phone);
+CREATE INDEX idx_message_queue_pending      ON message_queue(client_id, customer_phone, processed, received_at);
+CREATE INDEX idx_appointments_date          ON appointments(client_id, appointment_date);
+CREATE INDEX idx_appointments_phone         ON appointments(client_id, customer_phone);
+
+-- RLS (open to service role — auth handled at app level)
+ALTER TABLE conversations  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE message_queue  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE appointments   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clients        ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Service role full access" ON conversations  FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON message_queue  FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON appointments   FOR ALL USING (true);
+CREATE POLICY "Service role full access" ON clients        FOR ALL USING (true);
+```
+
+> ⚠️ If adding traffic-control to an EXISTING deployment (not a fresh one), run
+> `scripts/migrate_message_queue.sql` instead — it uses `ADD COLUMN IF NOT EXISTS`
+> and `CREATE TABLE IF NOT EXISTS` so it won't break existing data.
 
 ---
 
@@ -467,17 +571,261 @@ async def save_appointment(data: dict) -> dict:
 
 ---
 
-## SKILL 10: AI Agent (Gemini with Tool Use)
+## SKILL 10: Message Buffer — Traffic-Control Layer
+
+> ⚠️ REQUIRED for every deployment. Without this, burst messages from one customer
+> trigger multiple concurrent AI calls → confused responses + rate limit errors.
+
+### Why it exists
+Vercel serverless has NO shared in-process memory between requests. Standard Python
+locks (`asyncio.Lock`, `threading.Lock`) are invisible across concurrent invocations.
+All coordination must live in Supabase.
+
+### What it provides
+- **Per-customer processing lock**: only one Vercel function processes a given customer at a time.
+  Others save their message to the queue and return immediately.
+- **Message queue**: every message is persisted before any AI work begins — zero message loss.
+- **Debounce window**: the lock holder sleeps 2s so burst messages accumulate, turning
+  "Hola / Quiero corte / Mañana / Con Daniel" (4 AI calls) into 1 combined request.
+- **Stale-lock steal**: if a function crashes while holding the lock, it's stolen after 55s
+  (just under Vercel's 60s timeout) so a crash never permanently blocks a customer.
+
+### api/message_buffer.py
+```python
+from datetime import datetime, timezone, timedelta
+from api.supabase_client import supabase
+from api.client_manager import get_client_id
+
+DEBOUNCE_SECONDS = 2
+LOCK_STALE_AFTER = 55  # steal locks held longer than this
+
+async def enqueue_message(customer_phone: str, customer_name: str, message_body: str) -> None:
+    client_id = get_client_id()
+    supabase.table("message_queue").insert({
+        "client_id": client_id,
+        "customer_phone": customer_phone,
+        "customer_name": customer_name,
+        "message_body": message_body,
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "processed": False,
+    }).execute()
+
+async def try_acquire_lock(customer_phone: str) -> bool:
+    """
+    Atomic acquire: UPDATE WHERE processing_lock = FALSE.
+    Postgres serializes concurrent UPDATEs on the same row — only one caller wins.
+    Falls back to INSERT (new customer) or stale-lock steal.
+    """
+    client_id = get_client_id()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    result = (
+        supabase.table("conversations")
+        .update({"processing_lock": True, "lock_acquired_at": now_iso})
+        .eq("client_id", client_id)
+        .eq("customer_phone", customer_phone)
+        .eq("processing_lock", False)
+        .execute()
+    )
+    if result.data:
+        return True
+
+    existing = (
+        supabase.table("conversations")
+        .select("processing_lock, lock_acquired_at")
+        .eq("client_id", client_id)
+        .eq("customer_phone", customer_phone)
+        .execute()
+    )
+
+    if not existing.data:
+        try:
+            supabase.table("conversations").insert({
+                "client_id": client_id,
+                "customer_phone": customer_phone,
+                "customer_name": "Cliente",
+                "messages": [],
+                "processing_lock": True,
+                "lock_acquired_at": now_iso,
+            }).execute()
+            return True
+        except Exception:
+            return False  # another function inserted first
+
+    row = existing.data[0]
+    acquired_at_raw = row.get("lock_acquired_at")
+    if acquired_at_raw:
+        acquired_at = datetime.fromisoformat(acquired_at_raw.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - acquired_at).total_seconds()
+        if age >= LOCK_STALE_AFTER:
+            supabase.table("conversations").update({
+                "processing_lock": True,
+                "lock_acquired_at": now_iso,
+            }).eq("client_id", client_id).eq("customer_phone", customer_phone).execute()
+            return True
+
+    return False  # lock is fresh, another function is processing
+
+async def release_lock(customer_phone: str) -> None:
+    client_id = get_client_id()
+    supabase.table("conversations").update({
+        "processing_lock": False,
+        "lock_acquired_at": None,
+    }).eq("client_id", client_id).eq("customer_phone", customer_phone).execute()
+
+async def flush_pending_messages(customer_phone: str) -> list[dict]:
+    """Fetch and mark processed all pending messages. Caller must hold the lock."""
+    client_id = get_client_id()
+    result = (
+        supabase.table("message_queue")
+        .select("*")
+        .eq("client_id", client_id)
+        .eq("customer_phone", customer_phone)
+        .eq("processed", False)
+        .order("received_at")
+        .execute()
+    )
+    if not result.data:
+        return []
+    ids = [r["id"] for r in result.data]
+    supabase.table("message_queue").update({"processed": True}).in_("id", ids).execute()
+    return result.data
+
+async def has_pending_messages(customer_phone: str) -> bool:
+    client_id = get_client_id()
+    result = (
+        supabase.table("message_queue")
+        .select("id")
+        .eq("client_id", client_id)
+        .eq("customer_phone", customer_phone)
+        .eq("processed", False)
+        .limit(1)
+        .execute()
+    )
+    return bool(result.data)
+
+def combine_messages(messages: list[dict]) -> str:
+    """Join burst messages into one text block for a single AI turn."""
+    bodies = [m["message_body"].strip() for m in messages if m.get("message_body", "").strip()]
+    return "\n".join(bodies)
+```
+
+---
+
+## SKILL 11: AI Agent (Gemini with Tool Use)
 
 ### api/ai_agent.py
 This is the brain. It must:
 
-1. Load conversation history from Supabase
-2. Build system prompt with services, hours, current date
-3. Call Gemini with conversation + tools
-4. If Gemini returns function_call → execute the tool → feed result back → get final response
-5. Send final text to customer via WhatsApp
-6. Save updated conversation to Supabase
+1. Use the message buffer (SKILL 10) — never call AI directly from the webhook
+2. Load conversation history from Supabase
+3. Build system prompt with services, hours, current date
+4. Call Gemini with conversation + tools
+5. If Gemini returns function_call → execute the tool → feed result back → get final response
+6. Send final text to customer via WhatsApp
+7. Save updated conversation to Supabase
+
+### handle_incoming_message — traffic-control entry point
+
+> ⚠️ This is the ONLY public function called by webhook.py.
+> It uses message_buffer.py (SKILL 10). Never call `_run_ai_for_message` directly.
+
+```python
+import asyncio
+from api.message_buffer import (
+    DEBOUNCE_SECONDS, combine_messages, enqueue_message,
+    flush_pending_messages, has_pending_messages, release_lock, try_acquire_lock,
+)
+
+async def handle_incoming_message(customer_phone: str, customer_name: str, message_body: str):
+    # 1. Persist first — never lose a message
+    await enqueue_message(customer_phone, customer_name, message_body)
+
+    # 2. Try to become the processor for this customer
+    lock_acquired = await try_acquire_lock(customer_phone)
+    if not lock_acquired:
+        return  # another function holds the lock and will pick up this message
+
+    try:
+        while True:
+            # 3. Debounce — let burst messages pile into the queue
+            await asyncio.sleep(DEBOUNCE_SECONDS)
+
+            # 4. Grab all pending messages and combine into one AI request
+            messages = await flush_pending_messages(customer_phone)
+            if not messages:
+                break
+
+            combined = combine_messages(messages)
+            actual_name = messages[-1].get("customer_name") or customer_name
+
+            try:
+                await _run_ai_for_message(customer_phone, actual_name, combined)
+            except Exception as e:
+                print(f"[ai_agent] AI error for {customer_phone}: {e}")
+                try:
+                    await send_message(customer_phone,
+                        "Dame un momento, estoy teniendo dificultades técnicas. Intenta de nuevo en unos segundos.")
+                except Exception:
+                    pass
+
+            # 5. Check for messages that arrived while AI was thinking
+            if not await has_pending_messages(customer_phone):
+                break
+
+    finally:
+        # 6. Always release — even on crash — so the customer is never blocked
+        await release_lock(customer_phone)
+```
+
+### _run_ai_for_message — core AI pipeline (called only by handle_incoming_message)
+
+```python
+async def _run_ai_for_message(customer_phone: str, customer_name: str, message_text: str):
+    history = await get_conversation(customer_phone)
+    history.append({"role": "user", "parts": [{"text": message_text}]})
+    system_prompt = build_system_prompt()
+
+    contents = [
+        types.Content(role=m["role"], parts=[types.Part(text=m["parts"][0]["text"])])
+        for m in history
+    ]
+
+    response = await _gemini_call(contents, system_prompt)
+
+    # Tool-call loop
+    for _ in range(5):
+        parts = response.candidates[0].content.parts
+        function_calls = [p for p in parts if p.function_call]
+        if not function_calls:
+            break
+        tool_results = []
+        for part in function_calls:
+            result = await execute_tool(part.function_call.name, dict(part.function_call.args))
+            tool_results.append(types.Part(
+                function_response=types.FunctionResponse(
+                    name=part.function_call.name, response={"result": result}
+                )
+            ))
+        contents.append(types.Content(role="model", parts=parts))
+        contents.append(types.Content(role="user", parts=tool_results))
+        response = await _gemini_call(contents, system_prompt)
+
+    final_text = "".join(
+        p.text for p in response.candidates[0].content.parts if p.text
+    ) if response.candidates and response.candidates[0].content else ""
+
+    if not final_text:
+        final_text = "Disculpa, hubo un problema. Por favor intenta de nuevo."
+
+    await send_message(customer_phone, final_text)
+
+    history.append({"role": "model", "parts": [{"text": final_text}]})
+    try:
+        await save_conversation(customer_phone, customer_name, history)
+    except Exception as e:
+        print(f"[ai_agent] save_conversation FAILED: {e}")
+```
 
 ### Tool execution:
 ```python
@@ -489,7 +837,6 @@ async def execute_tool(tool_name: str, args: dict) -> str:
         return f"Horarios disponibles para {args['date']}: {', '.join(slots)}"
 
     elif tool_name == "create_appointment":
-        # Create calendar event
         title = f"✂️ {args['service_name']} - {args['customer_name']}"
         description = (
             f"Cliente: {args['customer_name']}\n"
@@ -501,16 +848,10 @@ async def execute_tool(tool_name: str, args: dict) -> str:
             title, description, args["date"],
             args["start_time"], args["duration_minutes"]
         )
-        # Save to Supabase
         end_minutes = int(args["start_time"].split(":")[0]) * 60 + \
                       int(args["start_time"].split(":")[1]) + args["duration_minutes"]
         end_time = f"{end_minutes // 60:02d}:{end_minutes % 60:02d}"
-
-        await save_appointment({
-            **args,
-            "end_time": end_time,
-            "google_event_id": event_id
-        })
+        await save_appointment({**args, "end_time": end_time, "google_event_id": event_id})
         return f"Cita creada exitosamente. Evento ID: {event_id}"
 
     return "Herramienta no reconocida."
@@ -518,7 +859,7 @@ async def execute_tool(tool_name: str, args: dict) -> str:
 
 ---
 
-## SKILL 11: Main Entry Point
+## SKILL 12: Main Entry Point
 
 ### api/index.py
 ```python
@@ -539,7 +880,7 @@ async def root():
 
 ---
 
-## SKILL 12: GitHub + Vercel Deployment
+## SKILL 13: GitHub + Vercel Deployment
 
 ### Steps Claude Code should execute:
 ```bash
@@ -591,7 +932,7 @@ messages = [
 
 ---
 
-## SKILL 13: Client Manager (Multi-tenant UUID resolver)
+## SKILL 14: Client Manager (Multi-tenant UUID resolver)
 
 Every deployment is linked to one row in the `clients` table via a UUID. This module
 resolves that UUID automatically so you never need to hardcode it.
