@@ -229,7 +229,7 @@ async def execute_tool(tool_name: str, args: dict) -> str:
     return "Herramienta no reconocida."
 
 
-GEMINI_MODEL = "models/gemini-2.0-flash-lite"
+GEMINI_MODEL = "gemini-1.5-flash"
 
 
 async def _gemini_call(contents, system_prompt, max_retries: int = 4):
